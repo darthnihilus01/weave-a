@@ -181,7 +181,8 @@ class AndroidBuilder:
             # On Windows, cmd.exe /c executes the batch wrapper. ulimit is not supported on Windows;
             # resource safety is enforced via watchdog timeout, log size bounds, and process-tree termination.
             cmd = ["cmd.exe", "/c", *gradle]
-            popen_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            popen_kwargs = {"creationflags": creation_flags}
         else:
             # Resource limits for the whole Gradle process tree: no core dumps, no file larger than 4 GiB.
             # (Applied with ulimit instead of preexec_fn, which is unsafe in this multi-threaded server.)

@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+import weave_validator
+
 from .schemas import AppManifest, GeneratedFile, RepairPatch
 
 SOURCE_ROOT = "app/src/main/java/com/genesis/app"
@@ -24,22 +26,9 @@ ALLOWED_SUFFIXES = {".kt"}
 # Server-controlled files inside the source root that the model may not replace.
 PROTECTED_FILES = {"MainActivity.kt"}
 PROTECTED_DIRS = ("ui/theme/", "ui/kit/")
-KIT_IMPORT_RE = re.compile(r"^\s*import\s+com\.genesis\.app\.ui\.kit\.", re.MULTILINE)
-
 SEGMENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 FILE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}\.kt$")
 
-# APIs that have no business in Phase 1 offline apps. Matched against code with comments/strings stripped.
-FORBIDDEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("process execution", re.compile(r"\bRuntime\s*\.\s*getRuntime\b|\bProcessBuilder\b")),
-    ("dynamic code loading", re.compile(r"\b(DexClassLoader|PathClassLoader|InMemoryDexClassLoader|URLClassLoader)\b|\bSystem\s*\.\s*load(Library)?\b|\bClass\s*\.\s*forName\b")),
-    ("networking", re.compile(r"\bjava\.net\b|\bHttpURLConnection\b|\bokhttp3?\b|\bretrofit2?\b|\bSocket\b|\bandroid\.net\.http\b")),
-    ("reflection", re.compile(r"\bkotlin\.reflect\.full\b|\bjava\.lang\.reflect\b|\.getDeclaredMethod\b|\.getDeclaredField\b")),
-    ("native code", re.compile(r"\bexternal\s+fun\b|@JvmStatic\s+external\b")),
-    ("shell/su", re.compile(r"\"/system/bin|\"su\"")),
-    ("webview", re.compile(r"\bWebView\b")),
-    ("unapproved libraries", re.compile(r"^\s*import\s+(?!androidx\.|android\.|kotlin\.|kotlinx\.coroutines\.|java\.util\.|java\.time\.|java\.text\.|java\.io\.Serializable|org\.json\.|com\.genesis\.app\b)", re.MULTILINE)),
-]
 
 
 class ValidationError(ValueError):
@@ -87,15 +76,6 @@ def normalize_rel_path(raw: str) -> str:
     return rel
 
 
-def strip_comments_and_strings(code: str) -> str:
-    """Rough Kotlin lexer pass so forbidden-API checks ignore comments and string literals."""
-    code = re.sub(r'"""[\s\S]*?"""', '""', code)
-    code = re.sub(r"/\*[\s\S]*?\*/", " ", code)
-    code = re.sub(r"//[^\n]*", "", code)
-    code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', code)
-    return code
-
-
 def expected_package(rel_path: str) -> str:
     dirs = list(PurePosixPath(rel_path).parts[:-1])
     return ".".join([BASE_PACKAGE, *dirs])
@@ -109,16 +89,11 @@ def validate_file(f: GeneratedFile) -> ValidatedFile:
         raise ValidationError(f"{rel} is empty")
     if size > MAX_FILE_BYTES:
         raise ValidationError(f"{rel} is {size} bytes (limit {MAX_FILE_BYTES})")
-    pkg = re.search(r"^\s*package\s+([\w.]+)", content, re.MULTILINE)
     want = expected_package(rel)
-    if not pkg or pkg.group(1) != want:
-        raise ValidationError(f"{rel} must declare `package {want}`")
-    stripped = strip_comments_and_strings(content)
-    for label, pattern in FORBIDDEN_PATTERNS:
-        m = pattern.search(stripped)
-        if m:
-            snippet = m.group(0).strip()[:80]
-            raise ValidationError(f"{rel} uses a disallowed API ({label}): {snippet!r}")
+    try:
+        weave_validator.validate_kotlin_source(content, want)
+    except ValueError as e:
+        raise ValidationError(f"{rel} {e}") from e
     return ValidatedFile(rel, content if content.endswith("\n") else content + "\n")
 
 
@@ -141,10 +116,9 @@ def _validate_files(files: list[GeneratedFile]) -> list[ValidatedFile]:
 
 def validate_manifest(manifest: AppManifest) -> list[ValidatedFile]:
     files = _validate_files(manifest.files)
-    entry = re.compile(r"@Composable\s+(?:internal\s+|public\s+)?fun\s+GenesisApp\s*\(\s*\)")
-    if not any("/" not in f.rel_path and entry.search(f.content) for f in files):
+    if not any("/" not in f.rel_path and weave_validator.has_genesis_app_entry(f.content) for f in files):
         raise ValidationError("generated code must define `@Composable fun GenesisApp()` in package com.genesis.app")
-    if not any(KIT_IMPORT_RE.search(f.content) for f in files):
+    if not any(weave_validator.has_design_kit_import(f.content) for f in files):
         raise ValidationError("generated UI must be built with the Genesis design kit (import com.genesis.app.ui.kit.*)")
     return files
 
